@@ -1,0 +1,6 @@
+{
+  "name": "stockvet",
+  "version": "1.0.0",
+  "description": "Controle de estoque veterinário",
+  "scripts": { "build": "echo ok" }
+}
