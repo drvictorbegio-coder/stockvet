@@ -341,13 +341,63 @@ const CF={medicamento:'💊 Medicamento',material:'🩹 Material',solucao:'💧 
 let pas=[],movs=[],nPa=100,nLote=1000,nMov=1;
 let expanded=new Set(),ePaId=null,eLoteId=null,eLotePaId=null;
 
-function loadData(){
+let _saveTimer=null;
+let _dbAvailable=null; // null=unknown, true=yes, false=no
+
+async function checkDB(){
+  if(_dbAvailable!==null)return _dbAvailable;
+  try{
+    const r=await fetch('/api/db');
+    if(r.status===503){_dbAvailable=false;return false;}
+    _dbAvailable=true;return true;
+  }catch(e){_dbAvailable=false;return false;}
+}
+
+async function loadData(){
+  // Show loading state
+  document.getElementById('alerts-bar').innerHTML='<span style="color:var(--mut);font-size:13px;">⏳ Carregando estoque...</span>';
+  
+  const hasDB=await checkDB();
+  if(hasDB){
+    try{
+      const r=await fetch('/api/db');
+      const d=await r.json();
+      if(d.stockData){const sd=d.stockData;pas=sd.pas||[];nPa=sd.nPa||100;nLote=sd.nLote||1000;}
+      if(d.movData){const md=d.movData;movs=md.movs||[];nMov=md.nMov||1;}
+      if(!pas.length){pas=sample();nPa=200;nLote=2000;await saveNow();}
+      return;
+    }catch(e){console.warn('DB load error:',e);}
+  }
+  // Fallback to localStorage
   try{const d=JSON.parse(localStorage.getItem(SK)||'null');if(d){pas=d.pas||[];nPa=d.nPa||100;nLote=d.nLote||1000;}}catch(e){}
   try{const m=JSON.parse(localStorage.getItem(MK)||'null');if(m){movs=m.movs||[];nMov=m.nMov||1;}}catch(e){}
   if(!pas.length){pas=sample();nPa=200;nLote=2000;}
 }
-function save(){try{localStorage.setItem(SK,JSON.stringify({pas,nPa,nLote}));}catch(e){}}
-function saveMov(){try{localStorage.setItem(MK,JSON.stringify({movs,nMov}));}catch(e){}}
+
+async function saveNow(){
+  const hasDB=await checkDB();
+  if(hasDB){
+    try{
+      await fetch('/api/db',{method:'POST',headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({type:'all',payload:{stockData:{pas,nPa,nLote},movData:{movs,nMov}}})});
+    }catch(e){console.warn('DB save error:',e);}
+  }
+  // Always also save locally as backup
+  try{localStorage.setItem(SK,JSON.stringify({pas,nPa,nLote}));}catch(e){}
+  try{localStorage.setItem(MK,JSON.stringify({movs,nMov}));}catch(e){}
+}
+
+// Debounced save — waits 800ms after last change to avoid too many requests
+function save(){
+  try{localStorage.setItem(SK,JSON.stringify({pas,nPa,nLote}));}catch(e){}
+  clearTimeout(_saveTimer);
+  _saveTimer=setTimeout(()=>saveNow(),800);
+}
+function saveMov(){
+  try{localStorage.setItem(MK,JSON.stringify({movs,nMov}));}catch(e){}
+  clearTimeout(_saveTimer);
+  _saveTimer=setTimeout(()=>saveNow(),800);
+}
 
 function sample(){
   const t=new Date(),d=(n)=>{let x=new Date(t);x.setDate(x.getDate()+n);return x.toISOString().split('T')[0];};
@@ -751,29 +801,130 @@ function deleteLote(){if(!confirm('Excluir este lote?'))return;pas=pas.map(p=>p.
 const NF_PROMPT=`Você é especialista em notas fiscais veterinárias brasileiras. Extraia TODOS os produtos. Para cada um retorne JSON: nomeComercial (nome na nota), principioAtivo (substância ativa ex: "Dipirona Monohidratada"), cat (medicamento/material/solucao/vacina/equipamento/outro), qty (número), unit (unidade/frasco/caixa/pacote/rolo/ampola/litro/ml), numLote (número do lote ou ""), chegada (data emissão YYYY-MM-DD ou ""), vencimento (validade YYYY-MM-DD ou ""). Retorne APENAS o array JSON.`;
 let nfItems=[];
 function handleDrop(e){e.preventDefault();document.getElementById('upload-zone').classList.remove('drag');handleFile(e.dataTransfer.files[0]);}
+
+async function loadPDFJS(){
+  if(window.pdfjsLib)return;
+  await new Promise((res,rej)=>{const s=document.createElement('script');s.src='https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js';s.onload=res;s.onerror=rej;document.head.appendChild(s);});
+  window.pdfjsLib.GlobalWorkerOptions.workerSrc='https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+}
+
+async function extractPDFText(arrayBuffer){
+  await loadPDFJS();
+  const pdf=await pdfjsLib.getDocument({data:arrayBuffer}).promise;
+  let fullText='';
+  for(let i=1;i<=pdf.numPages;i++){
+    const page=await pdf.getPage(i);
+    const tc=await page.getTextContent();
+    fullText+=tc.items.map(it=>it.str).join(' ')+'
+';
+  }
+  return fullText.trim();
+}
+
 function handleFile(file){
-  if(!file)return;const isImg=file.type.startsWith('image/'),isPdf=file.type==='application/pdf';
+  if(!file)return;
+  const isImg=file.type.startsWith('image/'),isPdf=file.type==='application/pdf';
   if(!isImg&&!isPdf){toast('Use PDF ou imagem','err');return;}
-  document.getElementById('upload-zone').classList.add('hidden');document.getElementById('proc-panel').classList.remove('hidden');setProcStep('📄 Lendo...',5);
-  const reader=new FileReader();
-  reader.onload=async(ev)=>{
+  document.getElementById('upload-zone').classList.add('hidden');
+  document.getElementById('proc-panel').classList.remove('hidden');
+  setProcStep('📄 Lendo arquivo...',5);
+
+  if(isPdf){
+    // PDF: extract text client-side, send only text to API (tiny payload)
+    const reader=new FileReader();
+    reader.onload=async(ev)=>{
+      try{
+        setProcStep('📄 Extraindo texto do PDF...',20);
+        const text=await extractPDFText(ev.target.result);
+        if(!text||text.length<50){
+          // PDF is image-based (scanned) — render pages as compressed images
+          setProcStep('🖼 PDF escaneado — convertendo páginas...',30);
+          await processPDFAsImages(ev.target.result);
+          return;
+        }
+        setProcStep('🔍 Analisando com IA...',50);
+        const items=await analyzeText(text);
+        finishNF(items);
+      }catch(err){resetNF();toast('Erro: '+String(err.message||err).slice(0,80),'err');}
+    };
+    reader.readAsArrayBuffer(file);
+  } else {
+    // Image: compress aggressively to stay under 3MB base64
+    const reader=new FileReader();
+    reader.onload=async(ev)=>{
+      try{
+        setProcStep('🖼 Comprimindo imagem...',20);
+        // Target ~2MB base64 = ~1.5MB image
+        let comp=await compImg(ev.target.result,1400,.75);
+        if(comp.length>2800000)comp=await compImg(ev.target.result,1000,.60);
+        if(comp.length>2800000)comp=await compImg(ev.target.result,800,.50);
+        const base64=comp.split(',')[1];
+        setProcStep('🔍 Analisando com IA...',50);
+        const part={type:'image',source:{type:'base64',media_type:'image/jpeg',data:base64}};
+        let rawText=await callAI([part,{type:'text',text:NF_PROMPT}]);
+        let items=[];
+        try{items=parseArr(rawText);}catch(e){
+          const lt=await callAI([part,{type:'text',text:'Liste produtos desta nota: NOME COMERCIAL | PRINCÍPIO ATIVO | QTD | UNIDADE. Se não ver, escreva VAZIO.'}]);
+          if(!lt.includes('VAZIO')&&lt.trim()){
+            const cv=await callAI([{type:'text',text:`Converta para JSON: nomeComercial,principioAtivo,cat,qty,unit,numLote(""),chegada(""),vencimento(""). Array JSON apenas.\n${lt}`}]);
+            try{items=parseArr(cv);}catch(e2){}
+          }
+        }
+        finishNF(items);
+      }catch(err){resetNF();toast('Erro: '+String(err.message||err).slice(0,80),'err');}
+    };
+    reader.readAsDataURL(file);
+  }
+}
+
+async function analyzeText(text){
+  // Send text only — very small payload, works on all plan limits
+  const rawText=await callAI([{type:'text',text:NF_PROMPT+'\n\nTexto da nota fiscal:\n'+text.slice(0,15000)}]);
+  let items=[];
+  try{items=parseArr(rawText);}catch(e){
+    const lt=await callAI([{type:'text',text:'A partir deste texto de nota fiscal, liste: NOME COMERCIAL | PRINCÍPIO ATIVO | QTD | UNIDADE. Se não houver produtos, escreva VAZIO.\n'+text.slice(0,10000)}]);
+    if(!lt.includes('VAZIO')&&lt.trim()){
+      const cv=await callAI([{type:'text',text:`Converta para JSON: nomeComercial,principioAtivo,cat,qty,unit,numLote(""),chegada(""),vencimento(""). Array JSON apenas.\n${lt}`}]);
+      try{items=parseArr(cv);}catch(e2){}
+    }
+  }
+  return items;
+}
+
+async function processPDFAsImages(arrayBuffer){
+  await loadPDFJS();
+  const pdf=await pdfjsLib.getDocument({data:arrayBuffer}).promise;
+  const total=pdf.numPages;
+  let allItems=[];
+  for(let p=1;p<=total;p++){
+    setProcStep(`🖼 Página ${p}/${total}...`,30+Math.round((p/total)*40));
+    const page=await pdf.getPage(p);
+    const scale=Math.min(1.2,900/(page.getViewport({scale:1}).width));
+    const vp=page.getViewport({scale});
+    const canvas=document.createElement('canvas');canvas.width=vp.width;canvas.height=vp.height;
+    await page.render({canvasContext:canvas.getContext('2d'),viewport:vp}).promise;
+    let dataUrl=canvas.toDataURL('image/jpeg',0.65);
+    if(dataUrl.length>2800000)dataUrl=canvas.toDataURL('image/jpeg',0.45);
+    const base64=dataUrl.split(',')[1];
     try{
-      let base64=ev.target.result.split(',')[1],mt=file.type;
-      if(isImg){setProcStep('🖼 Comprimindo...',20);let c=await compImg(ev.target.result,2000,.88);if(c.length>7000000)c=await compImg(ev.target.result,1400,.70);base64=c.split(',')[1];mt='image/jpeg';}
-      setProcStep('🔍 Analisando com IA...',45);
-      const part=isImg?{type:'image',source:{type:'base64',media_type:mt,data:base64}}:{type:'document',source:{type:'base64',media_type:'application/pdf',data:base64}};
-      let text=await callAI([part,{type:'text',text:NF_PROMPT}]);
-      setProcStep('🔄 Extraindo...',80);
-      let items=[];
-      try{items=parseArr(text);}catch(e){
-        const lt=await callAI([part,{type:'text',text:'Liste produtos desta nota: NOME COMERCIAL | PRINCÍPIO ATIVO | QTD | UNIDADE. Se não ver produtos, escreva VAZIO.'}]);
-        if(!lt.includes('VAZIO')&&lt.trim()){const cv=await callAI([{type:'text',text:`Converta para JSON array: nomeComercial, principioAtivo, cat(medicamento/material/solucao/vacina/equipamento/outro), qty, unit(unidade/frasco/caixa/pacote/rolo/ampola/litro/ml), numLote(""), chegada(""), vencimento(""). Retorne APENAS array JSON.\n\n${lt}`}]);try{items=parseArr(cv);}catch(e2){}}
-      }
-      setProcStep('✅ '+items.length+' produtos!',100);nfItems=items.map((x,i)=>({...x,_id:i}));
-      setTimeout(()=>{document.getElementById('proc-panel').classList.add('hidden');showNFPreview();},500);
-    }catch(err){document.getElementById('proc-panel').classList.add('hidden');document.getElementById('upload-zone').classList.remove('hidden');toast('Erro: '+(err.message||err).slice(0,80),'err');}
-  };
-  reader.readAsDataURL(file);
+      const raw=await callAI([{type:'image',source:{type:'base64',media_type:'image/jpeg',data:base64}},{type:'text',text:NF_PROMPT}]);
+      try{const parsed=parseArr(raw);allItems.push(...parsed);}catch(e){}
+    }catch(e){console.warn('Página '+p+' erro:',e.message);}
+  }
+  // Dedup by nomeComercial
+  const deduped=[];
+  for(const it of allItems){const ex=deduped.find(x=>x.nomeComercial?.toLowerCase()===it.nomeComercial?.toLowerCase());if(ex)ex.qty+=it.qty||0;else deduped.push({...it});}
+  finishNF(deduped);
+}
+
+function finishNF(items){
+  setProcStep('✅ '+items.length+' produtos identificados!',100);
+  nfItems=items.map((x,i)=>({...x,_id:i}));
+  setTimeout(()=>{document.getElementById('proc-panel').classList.add('hidden');showNFPreview();},500);
+}
+function resetNF(){
+  document.getElementById('proc-panel').classList.add('hidden');
+  document.getElementById('upload-zone').classList.remove('hidden');
 }
 async function callAI(content){
   const r=await fetch('/api/analyze',{method:'POST',headers:{'Content-Type':'application/json'},
@@ -840,7 +991,7 @@ function showPage(p){
 function toast(msg,type='ok'){
   const t=document.getElementById('toast');t.textContent=msg;t.style.borderColor=type==='err'?'var(--red)':'var(--grn)';t.classList.add('show');setTimeout(()=>t.classList.remove('show'),3500);
 }
-loadData();renderAll();
+(async()=>{await loadData();renderAll();})();
 </script>
 </body>
 </html>
